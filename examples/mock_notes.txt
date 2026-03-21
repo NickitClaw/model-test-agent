@@ -1,0 +1,2 @@
+Mock benchmark finished successfully.
+Throughput verified.

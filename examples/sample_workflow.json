@@ -1,0 +1,115 @@
+{
+  "name": "sample-vllm-benchmark",
+  "objective": "Launch a model server, wait for readiness, run a remote benchmark, and capture outputs.",
+  "description": "Reference workflow showing background server launch, SSH session setup, barrier synchronization, and interactive vim control.",
+  "sessions": {
+    "server": {
+      "transport": "local",
+      "shell": "/bin/bash",
+      "workdir": "/workspace/vllm"
+    },
+    "remote_bench": {
+      "transport": "ssh",
+      "shell": "/bin/bash",
+      "ssh_host": "10.0.0.15",
+      "ssh_user": "ubuntu",
+      "connect_ready_pattern": "[$#] "
+    }
+  },
+  "steps": [
+    {
+      "id": "launch_server",
+      "kind": "command",
+      "title": "Launch vLLM server",
+      "session": "server",
+      "depends_on": [],
+      "command": "docker run --rm -it --gpus all -p 8000:8000 -v /models:/models vllm/vllm-openai:latest --model /models/Qwen2.5-7B-Instruct",
+      "background": true,
+      "ready_pattern": "Application startup complete",
+      "fail_patterns": [
+        "Traceback",
+        "CUDA out of memory"
+      ],
+      "timeout_s": 600
+    },
+    {
+      "id": "prepare_remote_shell",
+      "kind": "command",
+      "title": "Prepare remote benchmark shell",
+      "session": "remote_bench",
+      "depends_on": [],
+      "command": "cd /bench && source .venv/bin/activate",
+      "timeout_s": 60
+    },
+    {
+      "id": "wait_for_server",
+      "kind": "barrier",
+      "title": "Wait for server readiness",
+      "depends_on": [],
+      "wait_for": [
+        "launch_server"
+      ],
+      "timeout_s": 600
+    },
+    {
+      "id": "run_benchmark",
+      "kind": "command",
+      "title": "Run benchmark client",
+      "session": "remote_bench",
+      "depends_on": [
+        "prepare_remote_shell",
+        "wait_for_server"
+      ],
+      "command": "python benchmark_serving.py --backend openai-chat --base-url http://10.0.0.2:8000/v1 --model Qwen2.5-7B-Instruct",
+      "timeout_s": 1800,
+      "fail_patterns": [
+        "Traceback",
+        "Connection refused"
+      ],
+      "success_patterns": [
+        "Throughput",
+        "Latency"
+      ]
+    },
+    {
+      "id": "capture_server_logs",
+      "kind": "capture",
+      "title": "Capture server logs",
+      "source_session": "server",
+      "depends_on": [
+        "run_benchmark"
+      ],
+      "lines": 200
+    },
+    {
+      "id": "open_notes",
+      "kind": "send_keys",
+      "title": "Open vim notes file",
+      "session": "remote_bench",
+      "depends_on": [
+        "run_benchmark"
+      ],
+      "keys": [
+        "vim notes.md"
+      ],
+      "literal": true,
+      "press_enter": true
+    },
+    {
+      "id": "write_notes",
+      "kind": "send_keys",
+      "title": "Write summary in vim",
+      "session": "remote_bench",
+      "depends_on": [
+        "open_notes"
+      ],
+      "keys": [
+        "i",
+        "Benchmark finished successfully.",
+        "Escape",
+        ":wq"
+      ],
+      "press_enter": true
+    }
+  ]
+}

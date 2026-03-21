@@ -1,0 +1,128 @@
+{
+  "name": "local-mock-benchmark",
+  "objective": "Exercise the PTY backend with a local server, local client, synchronization, and interactive text entry.",
+  "description": "Self-contained validation workflow for multi-session orchestration without tmux.",
+  "sessions": {
+    "server": {
+      "transport": "local",
+      "shell": "/bin/bash",
+      "workdir": "."
+    },
+    "client": {
+      "transport": "local",
+      "shell": "/bin/bash",
+      "workdir": "."
+    }
+  },
+  "steps": [
+    {
+      "id": "launch_server",
+      "kind": "command",
+      "title": "Launch mock server",
+      "session": "server",
+      "command": "python3 examples/mock_server.py",
+      "background": true,
+      "ready_pattern": "SERVER READY",
+      "fail_patterns": [
+        "Traceback"
+      ],
+      "timeout_s": 20
+    },
+    {
+      "id": "wait_for_server",
+      "kind": "barrier",
+      "title": "Wait for server readiness",
+      "wait_for": [
+        "launch_server"
+      ],
+      "timeout_s": 20
+    },
+    {
+      "id": "run_client",
+      "kind": "command",
+      "title": "Run mock client",
+      "session": "client",
+      "depends_on": [
+        "wait_for_server"
+      ],
+      "command": "python3 examples/mock_client.py",
+      "success_patterns": [
+        "Throughput:",
+        "Latency:"
+      ],
+      "fail_patterns": [
+        "Traceback"
+      ],
+      "timeout_s": 20
+    },
+    {
+      "id": "open_notes",
+      "kind": "command",
+      "title": "Start interactive note write",
+      "session": "client",
+      "depends_on": [
+        "run_client"
+      ],
+      "command": "cat > examples/mock_notes.txt",
+      "background": true
+    },
+    {
+      "id": "wait_writer_ready",
+      "kind": "sleep",
+      "title": "Allow interactive writer to attach",
+      "depends_on": [
+        "open_notes"
+      ],
+      "seconds": 0.2
+    },
+    {
+      "id": "write_notes",
+      "kind": "send_keys",
+      "title": "Write notes into interactive session",
+      "session": "client",
+      "depends_on": [
+        "wait_writer_ready"
+      ],
+      "keys": [
+        "Mock benchmark finished successfully.\n",
+        "Throughput verified.\n",
+        "C-d"
+      ]
+    },
+    {
+      "id": "flush_notes",
+      "kind": "sleep",
+      "title": "Allow shell to return after EOF",
+      "depends_on": [
+        "write_notes"
+      ],
+      "seconds": 0.2
+    },
+    {
+      "id": "verify_notes",
+      "kind": "command",
+      "title": "Verify notes file",
+      "session": "client",
+      "depends_on": [
+        "flush_notes"
+      ],
+      "command": "grep -n \"Throughput verified.\" examples/mock_notes.txt",
+      "success_patterns": [
+        "2:Throughput verified."
+      ],
+      "timeout_s": 20
+    },
+    {
+      "id": "stop_server",
+      "kind": "send_keys",
+      "title": "Stop server with Ctrl-C",
+      "session": "server",
+      "depends_on": [
+        "verify_notes"
+      ],
+      "keys": [
+        "C-c"
+      ]
+    }
+  ]
+}

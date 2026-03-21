@@ -1,0 +1,72 @@
+{
+  "name": "slow-server-system-test",
+  "objective": "Launch a server with a guaranteed 30-second startup delay, wait for readiness, then curl the health endpoint.",
+  "description": "System test workflow for a slow-start local HTTP server.",
+  "sessions": {
+    "server": {
+      "transport": "local",
+      "shell": "/bin/bash",
+      "workdir": "."
+    },
+    "client": {
+      "transport": "local",
+      "shell": "/bin/bash",
+      "workdir": "."
+    }
+  },
+  "steps": [
+    {
+      "id": "launch_server",
+      "kind": "command",
+      "title": "Launch slow-start server",
+      "session": "server",
+      "command": "python3 examples/slow_start_http_server.py --host 127.0.0.1 --port 18081 --startup-delay 30",
+      "background": true,
+      "ready_pattern": "SERVER READY host=127\\.0\\.0\\.1 port=18081 delay=30\\.0",
+      "fail_patterns": [
+        "Traceback"
+      ],
+      "timeout_s": 45
+    },
+    {
+      "id": "wait_for_server",
+      "kind": "barrier",
+      "title": "Wait for server readiness",
+      "wait_for": [
+        "launch_server"
+      ],
+      "timeout_s": 45
+    },
+    {
+      "id": "curl_healthz",
+      "kind": "command",
+      "title": "Call the health endpoint with curl",
+      "session": "client",
+      "depends_on": [
+        "wait_for_server"
+      ],
+      "command": "curl --fail --silent http://127.0.0.1:18081/healthz",
+      "success_patterns": [
+        "\"status\"\\s*:\\s*\"ok\""
+      ],
+      "fail_patterns": [
+        "Connection refused",
+        "Failed to connect",
+        "curl:"
+      ],
+      "timeout_s": 15
+    },
+    {
+      "id": "stop_server",
+      "kind": "send_keys",
+      "title": "Stop the server with Ctrl-C",
+      "session": "server",
+      "depends_on": [
+        "curl_healthz"
+      ],
+      "keys": [
+        "C-c"
+      ]
+    }
+  ]
+}
