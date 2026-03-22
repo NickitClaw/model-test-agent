@@ -40,6 +40,14 @@ def _list(value: Any) -> list[str]:
     raise TypeError(f"Expected list, got {type(value)!r}")
 
 
+def _dict(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    raise TypeError(f"Expected dict, got {type(value)!r}")
+
+
 @dataclass
 class SessionSpec:
     name: str
@@ -55,6 +63,7 @@ class SessionSpec:
     docker_container: str | None = None
     docker_image: str | None = None
     docker_run_args: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any]) -> "SessionSpec":
@@ -72,6 +81,7 @@ class SessionSpec:
             docker_container=data.get("docker_container"),
             docker_image=data.get("docker_image"),
             docker_run_args=_list(data.get("docker_run_args")),
+            metadata=_dict(data.get("metadata")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -92,6 +102,7 @@ class StepBase:
     continue_on_error: bool = False
     timeout_s: int | None = None
     retries: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -210,6 +221,7 @@ def step_from_dict(data: dict[str, Any]) -> WorkflowStep:
         continue_on_error=bool(data.get("continue_on_error", False)),
         timeout_s=int(data["timeout_s"]) if data.get("timeout_s") is not None else None,
         retries=int(data.get("retries", 0)),
+        metadata=_dict(data.get("metadata")),
     )
     if kind is StepKind.COMMAND:
         return CommandStep(
@@ -278,6 +290,7 @@ class WorkflowSpec:
     name: str
     objective: str
     description: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
     sessions: dict[str, SessionSpec] = field(default_factory=dict)
     steps: list[WorkflowStep] = field(default_factory=list)
 
@@ -292,6 +305,7 @@ class WorkflowSpec:
             name=str(data["name"]),
             objective=str(data.get("objective", "")),
             description=str(data.get("description", "")),
+            metadata=_dict(data.get("metadata")),
             sessions=sessions,
             steps=steps,
         )
@@ -301,6 +315,7 @@ class WorkflowSpec:
             "name": self.name,
             "objective": self.objective,
             "description": self.description,
+            "metadata": dict(self.metadata),
             "sessions": {name: spec.to_dict() for name, spec in self.sessions.items()},
             "steps": [step.to_dict() for step in self.steps],
         }

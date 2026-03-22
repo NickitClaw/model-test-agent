@@ -22,6 +22,7 @@ def get_workflow_json_schema() -> dict[str, Any]:
             "continue_on_error": {"type": "boolean"},
             "timeout_s": {"type": ["integer", "null"], "minimum": 1},
             "retries": {"type": "integer", "minimum": 0},
+            "metadata": {"type": "object"},
         },
         "additionalProperties": True,
     }
@@ -43,6 +44,7 @@ def get_workflow_json_schema() -> dict[str, Any]:
             "docker_container": {"type": ["string", "null"]},
             "docker_image": {"type": ["string", "null"]},
             "docker_run_args": {"type": "array", "items": {"type": "string"}},
+            "metadata": {"type": "object"},
         },
         "additionalProperties": False,
     }
@@ -56,6 +58,7 @@ def get_workflow_json_schema() -> dict[str, Any]:
             "name": {"type": "string", "minLength": 1},
             "objective": {"type": "string"},
             "description": {"type": "string"},
+            "metadata": {"type": "object"},
             "sessions": {
                 "type": "object",
                 "propertyNames": {"type": "string", "minLength": 1},

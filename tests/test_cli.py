@@ -122,6 +122,7 @@ class CliFormattingTests(unittest.TestCase):
         self.assertEqual(schema["type"], "object")
         self.assertIn("sessions", schema["properties"])
         self.assertIn("steps", schema["properties"])
+        self.assertIn("metadata", schema["properties"])
 
     def test_load_workflow_validates_before_normalization(self) -> None:
         payload = {

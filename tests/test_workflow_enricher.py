@@ -51,6 +51,12 @@ class WorkflowEnricherTests(unittest.TestCase):
         cleanup = next(step for step in enriched.steps if isinstance(step, SendKeysStep) and "C-c" in step.keys)
         self.assertEqual(cleanup.session, "server")
         self.assertIn("curl_healthz", cleanup.depends_on)
+        self.assertEqual(probe.metadata["provenance"]["origin"], "enricher")
+        self.assertTrue(enriched.metadata["enrichment"]["applied"])
+        self.assertGreater(enriched.metadata["enrichment"]["change_count"], 0)
+        self.assertTrue(
+            any(change["target"] == probe.id for change in enriched.metadata["enrichment"]["changes"])
+        )
 
     def test_enricher_replaces_ambiguous_ready_pattern_with_probe(self) -> None:
         workflow = WorkflowSpec.from_dict(
@@ -176,6 +182,11 @@ class WorkflowEnricherTests(unittest.TestCase):
         self.assertEqual(probe.session, "server_client")
         self.assertEqual(curl.session, "server_client")
         self.assertEqual(cleanup.session, "server_client")
+        self.assertEqual(enriched.sessions["server_client"].metadata["provenance"]["origin"], "enricher")
+        self.assertTrue(
+            any(change["kind"] == "session_inserted" and change["target"] == "server_client"
+                for change in enriched.metadata["enrichment"]["changes"])
+        )
 
     def test_enricher_does_not_treat_plain_setup_command_as_server(self) -> None:
         workflow = WorkflowSpec.from_dict(

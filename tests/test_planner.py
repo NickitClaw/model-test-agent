@@ -257,6 +257,47 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 2)
         self.assertIn("The previous JSON was invalid", client.calls[-1])
 
+    def test_planner_records_planning_metadata_and_step_provenance(self) -> None:
+        planner = WorkflowPlanner(
+            Settings(
+                base_url="http://example.com/v1",
+                api_key="",
+                model="test-model",
+                planner_model="test-model",
+                agent_model="test-model",
+            ),
+            client=FakePlannerClient(
+                {
+                    "name": "demo",
+                    "objective": "demo objective",
+                    "sessions": {"server": {"transport": "local"}},
+                    "steps": [
+                        {
+                            "id": "launch_server",
+                            "kind": "command",
+                            "title": "Launch server",
+                            "session": "server",
+                            "command": "python3 app.py --startup-delay 30",
+                        }
+                    ],
+                }
+            ),
+        )
+
+        workflow = planner.plan(
+            DocumentContent(
+                path=Path("runbook.md"),
+                media_type="text/markdown",
+                text="```bash\npython3 app.py --startup-delay 30\n```",
+            )
+        )
+
+        self.assertEqual(workflow.metadata["planning"]["origin"], "planner")
+        self.assertEqual(workflow.metadata["planning"]["planner_model"], "test-model")
+        self.assertEqual(workflow.sessions["server"].metadata["provenance"]["origin"], "planner")
+        launch = next(step for step in workflow.steps if step.id == "launch_server")
+        self.assertEqual(launch.metadata["provenance"]["origin"], "planner")
+
 
 if __name__ == "__main__":
     unittest.main()

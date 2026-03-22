@@ -144,6 +144,14 @@ class WorkflowPlanner:
             )
             try:
                 workflow = build_and_validate_workflow(payload)
+                self._annotate_planned_workflow(
+                    workflow,
+                    document=document,
+                    analysis=analysis,
+                    objective_hint=objective_hint,
+                    extra_instructions=extra_instructions,
+                    attempt=attempt,
+                )
                 workflow = self.normalizer.normalize(workflow, document.path)
                 workflow = self.enricher.enrich(workflow)
                 validate_workflow_spec(workflow)
@@ -165,6 +173,46 @@ class WorkflowPlanner:
                     reason=str(exc),
                 )
         raise RuntimeError(f"Planner could not produce a valid workflow after {self.settings.planner_max_attempts} attempt(s): {last_error}")
+
+    def _annotate_planned_workflow(
+        self,
+        workflow: WorkflowSpec,
+        *,
+        document: DocumentContent,
+        analysis: dict[str, Any],
+        objective_hint: str,
+        extra_instructions: str,
+        attempt: int,
+    ) -> None:
+        planning_meta = workflow.metadata.setdefault("planning", {})
+        planning_meta.update(
+            {
+                "origin": "planner",
+                "planner_model": self.settings.planner_model,
+                "attempt": attempt,
+                "document_path": str(document.path),
+                "document_media_type": document.media_type,
+                "objective_hint": objective_hint,
+                "extra_instructions": extra_instructions,
+                "analysis": analysis,
+                "explanation": (
+                    "This workflow skeleton was produced by the planning model from the source runbook. "
+                    "Later deterministic passes may normalize paths and add inferred waits or cleanup."
+                ),
+            }
+        )
+        for session in workflow.sessions.values():
+            self._set_initial_provenance(
+                session.metadata,
+                origin="planner",
+                reason="Session was planned directly from the source runbook.",
+            )
+        for step in workflow.steps:
+            self._set_initial_provenance(
+                step.metadata,
+                origin="planner",
+                reason="Step was planned directly from the source runbook.",
+            )
 
     @staticmethod
     def dump(workflow: WorkflowSpec) -> str:
@@ -295,3 +343,7 @@ class WorkflowPlanner:
                     "with buffered planning while keeping the terminal updated from local analysis."
                 ),
             )
+
+    @staticmethod
+    def _set_initial_provenance(metadata: dict[str, Any], *, origin: str, reason: str) -> None:
+        metadata.setdefault("provenance", {"origin": origin, "reason": reason})

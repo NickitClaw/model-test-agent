@@ -7,6 +7,7 @@ import re
 import shlex
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -45,7 +46,11 @@ class PtySession:
     name: str
     process: subprocess.Popen[bytes]
     master_fd: int
+    storage_log_path: str
     buffer: str = ""
+    buffer_start_chars: int = 0
+    total_output_chars: int = 0
+    storage_log_bytes: int = 0
     closed: bool = False
     combined_log_path: str | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -87,7 +92,14 @@ class PtyClient(SessionBackend):
             bufsize=0,
         )
         os.close(slave_fd)
-        session = PtySession(name=session_name, process=process, master_fd=master_fd)
+        storage_fd, storage_log_path = tempfile.mkstemp(prefix=f"mta-pty-{session_name}-", suffix=".log")
+        os.close(storage_fd)
+        session = PtySession(
+            name=session_name,
+            process=process,
+            master_fd=master_fd,
+            storage_log_path=storage_log_path,
+        )
         self._sessions[session_name] = session
         thread = threading.Thread(target=self._reader_loop, args=(session,), daemon=True)
         thread.start()
@@ -110,6 +122,10 @@ class PtyClient(SessionBackend):
             session.closed = True
             try:
                 os.close(session.master_fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(session.storage_log_path)
             except OSError:
                 pass
             with session.condition:
@@ -135,9 +151,17 @@ class PtyClient(SessionBackend):
 
     def attach_combined_log(self, session_name: str, log_path: str) -> None:
         session = self._get_session(session_name)
-        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(log_path).touch(exist_ok=True)
-        session.combined_log_path = log_path
+        target = Path(log_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with session.lock:
+            Path(log_path).write_text("")
+            try:
+                existing = Path(session.storage_log_path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                existing = ""
+            if existing:
+                target.write_text(existing, encoding="utf-8")
+            session.combined_log_path = str(target)
 
     def wait_for_pattern(
         self,
@@ -149,34 +173,13 @@ class PtyClient(SessionBackend):
         lines: int = 300,
     ) -> WaitResult:
         session = self._get_session(session_name)
-        ok_re = re.compile(pattern, re.MULTILINE)
-        fail_res = [re.compile(item, re.MULTILINE) for item in fail_patterns or []]
-        deadline = time.time() + timeout_s
-        last_view = ""
-        with session.condition:
-            while True:
-                last_view = self._tail_lines(session.buffer, lines)
-                for fail_re in fail_res:
-                    failed = fail_re.search(last_view)
-                    if failed:
-                        return WaitResult(
-                            status="failed",
-                            output=last_view,
-                            matched_pattern=fail_re.pattern,
-                            match_groups=failed.groups(),
-                        )
-                matched = ok_re.search(last_view)
-                if matched:
-                    return WaitResult(
-                        status="matched",
-                        output=last_view,
-                        matched_pattern=ok_re.pattern,
-                        match_groups=matched.groups(),
-                    )
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    return WaitResult(status="timeout", output=last_view)
-                session.condition.wait(timeout=min(self.poll_interval_s, remaining))
+        return self._wait_for_pattern_stream(
+            session=session,
+            pattern=pattern,
+            timeout_s=timeout_s,
+            fail_patterns=fail_patterns,
+            lines=lines,
+        )
 
     def run_command(
         self,
@@ -186,15 +189,20 @@ class PtyClient(SessionBackend):
         timeout_s: int,
         lines: int = 300,
     ) -> CommandResult:
+        session = self._get_session(session_name)
+        with session.lock:
+            start_offset = session.storage_log_bytes
         token = uuid.uuid4().hex[:10]
         start_token, done_token = make_command_markers(token)
         wrapped = wrap_command_with_markers(command, start_token, done_token)
         self.send_literal(session_name, wrapped)
-        wait = self.wait_for_pattern(
-            session_name,
-            re.escape(done_token) + r" (\d+)",
+        wait = self._wait_for_pattern_stream(
+            session=session,
+            pattern=re.escape(done_token) + r" (\d+)",
             timeout_s=timeout_s,
             lines=lines,
+            start_offset=start_offset,
+            return_full_output=True,
         )
         if wait.status != "matched":
             raise TimeoutError(f"Timed out waiting for command in session {session_name}")
@@ -226,21 +234,156 @@ class PtyClient(SessionBackend):
                 if exc.errno in {errno.EIO, errno.EBADF}:
                     break
                 text = f"\n[MTA PTY reader error: {exc}]\n"
+                self._append_log_chunk(session.storage_log_path, text)
                 with session.condition:
+                    session.storage_log_bytes += len(text.encode("utf-8"))
+                    session.total_output_chars += len(text)
                     session.buffer = self._trim_buffer(session.buffer + text)
+                    session.buffer_start_chars = session.total_output_chars - len(session.buffer)
                     session.condition.notify_all()
                 self._append_log_chunk(session.combined_log_path, text)
                 break
             if not chunk:
                 break
             text = self._normalize_output(chunk)
+            self._append_log_chunk(session.storage_log_path, text)
             self._append_log_chunk(session.combined_log_path, text)
             with session.condition:
+                session.storage_log_bytes += len(text.encode("utf-8"))
+                session.total_output_chars += len(text)
                 session.buffer = self._trim_buffer(session.buffer + text)
+                session.buffer_start_chars = session.total_output_chars - len(session.buffer)
                 session.condition.notify_all()
         session.closed = True
         with session.condition:
             session.condition.notify_all()
+
+    def _wait_for_pattern_stream(
+        self,
+        *,
+        session: PtySession,
+        pattern: str,
+        timeout_s: int,
+        fail_patterns: list[str] | None = None,
+        lines: int = 300,
+        start_offset: int | None = None,
+        return_full_output: bool = False,
+    ) -> WaitResult:
+        ok_re = re.compile(pattern, re.MULTILINE)
+        fail_res = [re.compile(item, re.MULTILINE) for item in fail_patterns or []]
+        carryover_limit = max(4096, len(pattern) * 8, *(len(item) * 8 for item in (fail_patterns or [])))
+        deadline = time.time() + timeout_s
+        last_view = ""
+        scan_tail = ""
+        read_offset = start_offset
+        with session.condition:
+            if read_offset is None:
+                last_view = self._tail_lines(session.buffer, lines)
+                for fail_re in fail_res:
+                    failed = fail_re.search(last_view)
+                    if failed:
+                        return WaitResult(
+                            status="failed",
+                            output=last_view,
+                            matched_pattern=fail_re.pattern,
+                            match_groups=failed.groups(),
+                        )
+                matched = ok_re.search(last_view)
+                if matched:
+                    return WaitResult(
+                        status="matched",
+                        output=last_view,
+                        matched_pattern=ok_re.pattern,
+                        match_groups=matched.groups(),
+                    )
+                read_offset = session.storage_log_bytes
+            while True:
+                chunk, read_offset = self._read_storage_log_since(session.storage_log_path, read_offset)
+                if chunk:
+                    scan_window = scan_tail + chunk
+                    for fail_re in fail_res:
+                        failed = fail_re.search(scan_window)
+                        if failed:
+                            output = self._full_or_tail_output(
+                                session.storage_log_path,
+                                start_offset,
+                                read_offset,
+                                lines=lines,
+                                return_full_output=return_full_output,
+                            )
+                            return WaitResult(
+                                status="failed",
+                                output=output,
+                                matched_pattern=fail_re.pattern,
+                                match_groups=failed.groups(),
+                            )
+                    matched = ok_re.search(scan_window)
+                    if matched:
+                        output = self._full_or_tail_output(
+                            session.storage_log_path,
+                            start_offset,
+                            read_offset,
+                            lines=lines,
+                            return_full_output=return_full_output,
+                        )
+                        return WaitResult(
+                            status="matched",
+                            output=output,
+                            matched_pattern=ok_re.pattern,
+                            match_groups=matched.groups(),
+                        )
+                    scan_tail = scan_window[-carryover_limit:]
+                    last_view = self._full_or_tail_output(
+                        session.storage_log_path,
+                        start_offset,
+                        read_offset,
+                        lines=lines,
+                        return_full_output=False,
+                    )
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return WaitResult(status="timeout", output=last_view)
+                session.condition.wait(timeout=min(self.poll_interval_s, remaining))
+
+    @staticmethod
+    def _read_storage_log_since(path: str, offset: int) -> tuple[str, int]:
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(offset)
+                data = handle.read()
+                return data.decode("utf-8", errors="replace"), offset + len(data)
+        except OSError:
+            return "", offset
+
+    def _full_or_tail_output(
+        self,
+        storage_log_path: str,
+        start_offset: int | None,
+        end_offset: int,
+        *,
+        lines: int,
+        return_full_output: bool,
+    ) -> str:
+        if start_offset is None:
+            return self._read_log_tail_lines(storage_log_path, end_offset=end_offset, lines=lines)
+        text = self._read_log_slice(storage_log_path, start_offset, end_offset)
+        if return_full_output:
+            return text
+        return self._tail_lines(text, lines)
+
+    @staticmethod
+    def _read_log_slice(path: str, start_offset: int, end_offset: int) -> str:
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(start_offset)
+                data = handle.read(max(0, end_offset - start_offset))
+                return data.decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def _read_log_tail_lines(self, path: str, *, end_offset: int, lines: int) -> str:
+        text = self._read_log_slice(path, 0, end_offset)
+        return self._tail_lines(text, lines)
 
     def _trim_buffer(self, text: str) -> str:
         if len(text) <= self.buffer_max_chars:

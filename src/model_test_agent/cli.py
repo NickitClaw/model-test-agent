@@ -212,6 +212,10 @@ def _build_parser() -> argparse.ArgumentParser:
 def _doctor(settings: Settings) -> None:
     resolved_backend = resolve_session_backend(settings)
     print(f"session backend: {settings.session_backend} -> {resolved_backend}")
+    if settings.config_paths:
+        print("config files:")
+        for path in settings.config_paths:
+            print(f"- {path}")
     rows = [
         ("tmux", settings.tmux_bin),
         ("ssh", "ssh"),
