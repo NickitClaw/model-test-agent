@@ -59,6 +59,7 @@ The agent reads these environment variables:
 - `MTA_TMUX_BIN` to override the `tmux` binary path
 - `MTA_LOG_ROOT` to override the per-run log root directory. Defaults to `.mta-runs` under the current working directory.
 - `MTA_SESSION_BUFFER_MAX_CHARS` to control how much recent PTY output is retained
+- `MTA_STREAM_AGENT_OUTPUT=true|false` to control whether the agent streams its natural-language narration token by token when the model endpoint supports SSE
 
 ## CLI
 
@@ -73,6 +74,8 @@ Run a generated workflow through the agent:
 ```bash
 mta run-workflow workflow.json
 ```
+
+When the configured OpenAI-compatible endpoint supports streaming chat completions, the agent narrates its next move incrementally in the terminal, similar to an interactive coding assistant. If the endpoint does not support SSE streaming, the runner falls back to buffered assistant messages automatically.
 
 Run a workflow directly without the LLM agent:
 

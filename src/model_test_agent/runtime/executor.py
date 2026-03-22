@@ -214,6 +214,7 @@ class WorkflowExecutor:
             step_id=step.id,
             kind=step.kind.value,
             title=step.title,
+            session_name=step.session,
             index=index,
             total=total,
         )
@@ -234,6 +235,9 @@ class WorkflowExecutor:
         self._emit_progress(
             "step_finished",
             step_id=step.id,
+            kind=step.kind.value,
+            title=step.title,
+            session_name=step.session,
             status=result.status.value,
             summary=result.summary,
             index=index,

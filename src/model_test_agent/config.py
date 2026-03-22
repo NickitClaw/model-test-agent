@@ -4,6 +4,19 @@ import os
 from dataclasses import dataclass
 
 
+def _env_bool(value: str | None, default: bool) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if not normalized:
+        return default
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 @dataclass
 class Settings:
     base_url: str
@@ -19,6 +32,7 @@ class Settings:
     default_capture_lines: int = 300
     default_timeout_s: int = 300
     max_iterations: int = 60
+    stream_agent_output: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -37,6 +51,10 @@ class Settings:
         default_capture_lines = int(os.getenv("MTA_CAPTURE_LINES", os.getenv("MBA_CAPTURE_LINES", "300")))
         default_timeout_s = int(os.getenv("MTA_TIMEOUT_S", os.getenv("MBA_TIMEOUT_S", "300")))
         max_iterations = int(os.getenv("MTA_MAX_ITERATIONS", os.getenv("MBA_MAX_ITERATIONS", "60")))
+        stream_agent_output = _env_bool(
+            os.getenv("MTA_STREAM_AGENT_OUTPUT", os.getenv("MBA_STREAM_AGENT_OUTPUT")),
+            True,
+        )
         return cls(
             base_url=base_url,
             api_key=api_key,
@@ -51,6 +69,7 @@ class Settings:
             default_capture_lines=default_capture_lines,
             default_timeout_s=default_timeout_s,
             max_iterations=max_iterations,
+            stream_agent_output=stream_agent_output,
         )
 
     def require_model_access(self) -> None:

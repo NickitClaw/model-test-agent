@@ -21,6 +21,17 @@ class FakePlannerClient:
         return self.payload
 
 
+class FakeStreamingPlannerClient(FakePlannerClient):
+    def chat(self, *, model: str, messages, stream: bool = False, on_delta=None, **kwargs):
+        del model, messages, kwargs
+        if stream and on_delta is not None:
+            on_delta({"type": "content_start"})
+            on_delta({"type": "content_delta", "text": "I will first identify the service launch. "})
+            on_delta({"type": "content_delta", "text": "Then I will map waits and cleanup."})
+            on_delta({"type": "content_end"})
+        return None
+
+
 class PlannerTests(unittest.TestCase):
     def test_planner_defaults_placeholder_local_workdir_to_invocation_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -128,6 +139,59 @@ class PlannerTests(unittest.TestCase):
                 invocation_cwd=base,
             )
             self.assertEqual(normalized.sessions["server"].workdir, str(doc_dir.resolve()))
+
+    def test_planner_emits_analysis_and_streaming_progress_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            document_path = Path(tmpdir) / "runbook.md"
+            document_path.write_text(
+                "# Runbook\n\n"
+                "## Start Server\n"
+                "```bash\npython3 app.py --startup-delay 30\n```\n\n"
+                "## Check Health\n"
+                "```bash\ncurl --fail --silent http://127.0.0.1:8080/healthz\n```\n"
+            )
+            events: list[dict[str, object]] = []
+            planner = WorkflowPlanner(
+                Settings(
+                    base_url="http://example.com/v1",
+                    api_key="",
+                    model="test-model",
+                    planner_model="test-model",
+                    agent_model="test-model",
+                ),
+                client=FakeStreamingPlannerClient(
+                    {
+                        "name": "demo",
+                        "objective": "demo",
+                        "sessions": {"server": {"transport": "local", "workdir": "/workspace"}},
+                        "steps": [
+                            {
+                                "id": "launch_server",
+                                "kind": "command",
+                                "title": "Launch server",
+                                "session": "server",
+                                "command": "python3 app.py --startup-delay 30",
+                            }
+                        ],
+                    }
+                ),
+                progress_callback=events.append,
+            )
+
+            planner.plan(
+                DocumentContent(
+                    path=document_path,
+                    media_type="text/markdown",
+                    text=document_path.read_text(),
+                )
+            )
+
+            names = [str(item.get("event")) for item in events]
+            self.assertIn("document_analysis", names)
+            self.assertIn("planning_model_call", names)
+            self.assertIn("planner_stream_started", names)
+            self.assertIn("planner_stream_delta", names)
+            self.assertIn("planner_stream_finished", names)
 
 
 if __name__ == "__main__":

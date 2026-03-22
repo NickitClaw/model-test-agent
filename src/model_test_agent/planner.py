@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+from typing import Any, Callable
 
 from .config import Settings
 from .document_loader import DocumentContent
@@ -74,13 +76,35 @@ Rules:
 - Output valid JSON only. Do not wrap it in Markdown fences.
 """
 
+PLANNER_NARRATION_SYSTEM_PROMPT = """You are briefly narrating how you will convert a Linux CLI runbook into an executable workflow.
+
+Rules:
+- Speak to the operator in first person.
+- Use 2-4 short sentences total.
+- Mention the main phases you see in the document and the next thing you will do.
+- Do not reveal private chain-of-thought.
+- Do not output JSON or Markdown bullets unless they fit naturally in one sentence.
+"""
+
 
 class WorkflowPlanner:
-    def __init__(self, settings: Settings, client: OpenAICompatClient | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        client: OpenAICompatClient | None = None,
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         self.settings = settings
         self.client = client or OpenAICompatClient(settings.base_url, settings.api_key)
         self.enricher = WorkflowEnricher()
         self.normalizer = WorkflowNormalizer()
+        self._progress_callback = progress_callback
+
+    def _emit_progress(self, event: str, **payload: Any) -> None:
+        if self._progress_callback is None:
+            return
+        self._progress_callback({"event": event, **payload})
 
     def plan(
         self,
@@ -99,6 +123,16 @@ class WorkflowPlanner:
             "If the document is ambiguous, choose a safe, reviewable workflow and preserve the uncertainty in the step titles or description.\n\n"
             f"{document.text[:50000]}"
         )
+        analysis = self.analyze_document(document)
+        if analysis:
+            self._emit_progress("document_analysis", **analysis)
+        self._emit_progress("planning_model_call", model=self.settings.planner_model)
+        self._stream_planning_note(
+            document=document,
+            objective_hint=objective_hint,
+            extra_instructions=extra_instructions,
+            analysis=analysis,
+        )
         payload = self.client.complete_json(
             model=self.settings.planner_model,
             system_prompt=PLANNER_SYSTEM_PROMPT,
@@ -111,3 +145,129 @@ class WorkflowPlanner:
     @staticmethod
     def dump(workflow: WorkflowSpec) -> str:
         return json.dumps(workflow.to_dict(), indent=2, ensure_ascii=False)
+
+    def analyze_document(self, document: DocumentContent) -> dict[str, Any]:
+        text = document.text or ""
+        lines = text.splitlines()
+        headings = [
+            line.lstrip("#").strip()
+            for line in lines
+            if line.lstrip().startswith("#") and line.lstrip("#").strip()
+        ][:6]
+        commands = self._extract_command_lines(text)
+        phases: list[str] = []
+        for item in headings + commands:
+            phase = self._phase_from_text(item)
+            if phase and phase not in phases:
+                phases.append(phase)
+        if not phases:
+            phases.append("extract the command flow and map it into sessions, waits, and cleanup")
+        return {
+            "heading_count": len(headings),
+            "command_count": len(commands),
+            "phases": phases[:5],
+            "headings": headings[:4],
+            "command_samples": commands[:4],
+        }
+
+    @staticmethod
+    def _extract_command_lines(text: str) -> list[str]:
+        commands: list[str] = []
+        in_fence = False
+        for raw_line in text.splitlines():
+            line = raw_line.rstrip()
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                in_fence = not in_fence
+                continue
+            if not stripped:
+                continue
+            if in_fence:
+                if not stripped.startswith("#"):
+                    commands.append(stripped)
+                continue
+            if re.match(r"^\s*(?:\$|>\s|\d+\.\s+|[-*]\s+)", line):
+                candidate = re.sub(r"^\s*(?:\$|>\s|\d+\.\s+|[-*]\s+)", "", line).strip()
+                if candidate and any(ch.isalpha() for ch in candidate):
+                    commands.append(candidate)
+        return commands[:12]
+
+    @staticmethod
+    def _phase_from_text(text: str) -> str | None:
+        lowered = text.lower()
+        if any(token in lowered for token in ("ssh", "docker exec", "docker run -it", "vim", "tmux", "screen")):
+            return "enter remote or interactive terminal environments"
+        if any(
+            token in lowered
+            for token in ("launch", "start", "server", "serve", "uvicorn", "gunicorn", "http.server", "vllm")
+        ):
+            return "bring up the service or model server"
+        if any(token in lowered for token in ("wait", "ready", "health", "probe", "curl", "wget", "/healthz")):
+            return "wait for readiness and verify the service is responding"
+        if any(token in lowered for token in ("benchmark", "client", "throughput", "latency", "req/s")):
+            return "run client-side checks or performance measurements"
+        if any(token in lowered for token in ("cleanup", "stop", "pkill", "killall", "ctrl-c", "c-c")):
+            return "clean up the long-running processes and sessions"
+        return None
+
+    def _stream_planning_note(
+        self,
+        *,
+        document: DocumentContent,
+        objective_hint: str,
+        extra_instructions: str,
+        analysis: dict[str, Any],
+    ) -> None:
+        if not self.settings.stream_agent_output:
+            return
+        chat = getattr(self.client, "chat", None)
+        if not callable(chat):
+            return
+        summary = json.dumps(analysis, ensure_ascii=False)
+        excerpt = document.text[:8000]
+        stream_open = False
+
+        def on_delta(event: dict[str, Any]) -> None:
+            nonlocal stream_open
+            kind = event.get("type")
+            if kind == "content_start":
+                self._emit_progress("planner_stream_started")
+                stream_open = True
+            elif kind == "content_delta":
+                text = str(event.get("text", ""))
+                if text:
+                    self._emit_progress("planner_stream_delta", text=text)
+            elif kind == "content_end" and stream_open:
+                self._emit_progress("planner_stream_finished")
+                stream_open = False
+
+        try:
+            chat(
+                model=self.settings.planner_model,
+                messages=[
+                    {"role": "system", "content": PLANNER_NARRATION_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Objective hint: {objective_hint or '(none)'}\n"
+                            f"Extra instructions: {extra_instructions or '(none)'}\n"
+                            f"Document analysis: {summary}\n\n"
+                            f"Document excerpt:\n{excerpt}"
+                        ),
+                    },
+                ],
+                stream=True,
+                on_delta=on_delta,
+                temperature=0.1,
+                max_tokens=240,
+            )
+        except Exception:
+            if stream_open:
+                self._emit_progress("planner_stream_finished")
+            self._emit_progress(
+                "narration",
+                message=(
+                    "Streaming planner narration is unavailable on this endpoint, so I will continue "
+                    "with buffered planning while keeping the terminal updated from local analysis."
+                ),
+            )

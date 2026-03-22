@@ -12,7 +12,7 @@ from .config import Settings
 from .document_loader import DocumentLoader
 from .models import WorkflowSpec
 from .planner import WorkflowPlanner
-from .progress import ConsoleProgressReporter
+from .progress import ConsoleProgressReporter, summarize_workflow
 from .runtime.executor import WorkflowExecutor
 from .runtime.factory import resolve_session_backend
 from .workflow_enricher import WorkflowEnricher
@@ -33,42 +33,95 @@ def main() -> None:
         _doctor(settings)
         return
     if args.command == "plan":
+        reporter = ConsoleProgressReporter()
         document = loader.load(args.document)
-        workflow = WorkflowPlanner(settings).plan(
-            document,
-            objective_hint=args.objective or "",
-            extra_instructions=args.instructions or "",
+        reporter.emit({"event": "planning_started", "path": str(document.path)})
+        reporter.emit(
+            {
+                "event": "document_loaded",
+                "media_type": document.media_type,
+                "line_count": document.text.count("\n") + 1 if document.text else 0,
+                "char_count": len(document.text),
+            }
         )
-        payload = json.dumps(workflow.to_dict(), indent=2, ensure_ascii=False)
-        if args.output:
-            Path(args.output).write_text(payload)
-        else:
-            print(payload)
+        try:
+            workflow = WorkflowPlanner(settings, progress_callback=reporter.emit).plan(
+                document,
+                objective_hint=args.objective or "",
+                extra_instructions=args.instructions or "",
+            )
+            reporter.emit({"event": "workflow_planned", **summarize_workflow(workflow)})
+            payload = json.dumps(workflow.to_dict(), indent=2, ensure_ascii=False)
+            if args.output:
+                Path(args.output).write_text(payload)
+            else:
+                print(payload)
+        finally:
+            reporter.stop()
         return
     if args.command == "run-workflow":
+        reporter = ConsoleProgressReporter()
         workflow = WorkflowSpec.from_dict(json.loads(Path(args.workflow).read_text()))
         workflow = normalizer.normalize(workflow, args.workflow)
         workflow = enricher.enrich(workflow)
-        report = _run_workflow_with_agent(workflow, settings)
-        print(_format_run_summary(status=report.status, summary=report.summary, state=report.state, iterations=report.iterations))
+        try:
+            reporter.emit({"event": "workflow_execution_started", **summarize_workflow(workflow)})
+            report = _run_workflow_with_agent(workflow, settings, reporter=reporter)
+            print(
+                _format_run_summary(
+                    status=report.status,
+                    summary=report.summary,
+                    state=report.state,
+                    iterations=report.iterations,
+                )
+            )
+        finally:
+            reporter.stop()
         return
     if args.command == "exec-workflow":
+        reporter = ConsoleProgressReporter()
         workflow = WorkflowSpec.from_dict(json.loads(Path(args.workflow).read_text()))
         workflow = normalizer.normalize(workflow, args.workflow)
         workflow = enricher.enrich(workflow)
-        _exec_workflow(workflow, settings, keep_sessions=args.keep_sessions)
+        try:
+            reporter.emit({"event": "workflow_execution_started", **summarize_workflow(workflow)})
+            _exec_workflow(workflow, settings, keep_sessions=args.keep_sessions, reporter=reporter)
+        finally:
+            reporter.stop()
         return
     if args.command == "run-document":
+        reporter = ConsoleProgressReporter()
         document = loader.load(args.document)
-        workflow = WorkflowPlanner(settings).plan(
-            document,
-            objective_hint=args.objective or "",
-            extra_instructions=args.instructions or "",
-        )
-        if args.plan_output:
-            Path(args.plan_output).write_text(json.dumps(workflow.to_dict(), indent=2, ensure_ascii=False))
-        report = _run_workflow_with_agent(workflow, settings)
-        print(_format_run_summary(status=report.status, summary=report.summary, state=report.state, iterations=report.iterations))
+        try:
+            reporter.emit({"event": "planning_started", "path": str(document.path)})
+            reporter.emit(
+                {
+                    "event": "document_loaded",
+                    "media_type": document.media_type,
+                    "line_count": document.text.count("\n") + 1 if document.text else 0,
+                    "char_count": len(document.text),
+                }
+            )
+            workflow = WorkflowPlanner(settings, progress_callback=reporter.emit).plan(
+                document,
+                objective_hint=args.objective or "",
+                extra_instructions=args.instructions or "",
+            )
+            reporter.emit({"event": "workflow_planned", **summarize_workflow(workflow)})
+            if args.plan_output:
+                Path(args.plan_output).write_text(json.dumps(workflow.to_dict(), indent=2, ensure_ascii=False))
+            reporter.emit({"event": "workflow_execution_started", **summarize_workflow(workflow)})
+            report = _run_workflow_with_agent(workflow, settings, reporter=reporter)
+            print(
+                _format_run_summary(
+                    status=report.status,
+                    summary=report.summary,
+                    state=report.state,
+                    iterations=report.iterations,
+                )
+            )
+        finally:
+            reporter.stop()
         return
     raise ValueError(f"Unsupported command: {args.command}")
 
@@ -121,8 +174,15 @@ def _doctor(settings: Settings) -> None:
     print(f"model access: {model_state}")
 
 
-def _exec_workflow(workflow: WorkflowSpec, settings: Settings, *, keep_sessions: bool = False) -> None:
-    reporter = ConsoleProgressReporter()
+def _exec_workflow(
+    workflow: WorkflowSpec,
+    settings: Settings,
+    *,
+    keep_sessions: bool = False,
+    reporter: ConsoleProgressReporter | None = None,
+) -> None:
+    own_reporter = reporter is None
+    reporter = reporter or ConsoleProgressReporter()
     executor = WorkflowExecutor(workflow, settings, progress_callback=reporter.emit)
     reporter.bind_executor(executor)
     try:
@@ -131,13 +191,12 @@ def _exec_workflow(workflow: WorkflowSpec, settings: Settings, *, keep_sessions:
             if not ready:
                 notifications = executor.drain_notifications()
                 if notifications:
-                    print(json.dumps({"notifications": notifications}, ensure_ascii=False, indent=2))
+                    reporter.emit({"event": "background_notifications", "notifications": notifications})
                     continue
-                print(json.dumps(executor.describe_state(), ensure_ascii=False, indent=2))
+                reporter.emit({"event": "workflow_stalled"})
                 raise RuntimeError("No ready steps are available; workflow may be deadlocked")
             step_id = ready[0]
-            result = executor.run_step(step_id)
-            print(json.dumps({"step_id": step_id, "result": result}, ensure_ascii=False, indent=2))
+            executor.run_step(step_id)
             time.sleep(0.05)
         final_state = executor.describe_state()
         print(
@@ -148,13 +207,20 @@ def _exec_workflow(workflow: WorkflowSpec, settings: Settings, *, keep_sessions:
             )
         )
     finally:
-        reporter.stop()
+        if own_reporter:
+            reporter.stop()
         if not keep_sessions:
             executor.close_all()
 
 
-def _run_workflow_with_agent(workflow: WorkflowSpec, settings: Settings):
-    reporter = ConsoleProgressReporter()
+def _run_workflow_with_agent(
+    workflow: WorkflowSpec,
+    settings: Settings,
+    *,
+    reporter: ConsoleProgressReporter | None = None,
+):
+    own_reporter = reporter is None
+    reporter = reporter or ConsoleProgressReporter()
     executor = WorkflowExecutor(workflow, settings, progress_callback=reporter.emit)
     reporter.bind_executor(executor)
     try:
@@ -166,7 +232,8 @@ def _run_workflow_with_agent(workflow: WorkflowSpec, settings: Settings):
         )
         return agent.run()
     finally:
-        reporter.stop()
+        if own_reporter:
+            reporter.stop()
         executor.close_all()
 
 

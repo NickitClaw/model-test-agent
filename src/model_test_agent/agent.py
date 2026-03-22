@@ -20,6 +20,8 @@ Operating rules:
 - Use `run_command` and `send_keys` as escape hatches when the workflow needs small corrections or interactive recovery.
 - Do not skip failed steps silently.
 - When a server or watcher runs in the background, keep moving on other independent work and synchronize with barriers or state checks.
+- Before each batch of tool calls, write 1-2 short operator-facing sentences that explain what you are about to do or what you are waiting for.
+- Keep that narration high level. Do not reveal private chain-of-thought. Do not dump JSON.
 - When you are done, call `complete_run`.
 - If the run cannot continue, call `fail_run`.
 """
@@ -76,6 +78,7 @@ class ModelTestAgent:
             },
         ]
         iterations = 0
+        stream_enabled = self.settings.stream_agent_output
         while iterations < self.settings.max_iterations:
             iterations += 1
             self._emit_progress(
@@ -97,15 +100,59 @@ class ModelTestAgent:
                 self._final_status = "failed"
                 self._final_summary = stalled_reason
                 break
-            response = self.client.chat(
-                model=self.settings.agent_model,
-                messages=messages,
-                tools=[tool["schema"] for tool in self._tools.values()],
-            )
+            streamed_any_text = False
+            stream_started = False
+
+            def on_delta(event: dict[str, Any]) -> None:
+                nonlocal streamed_any_text, stream_started
+                if event.get("type") == "content_start":
+                    self._emit_progress("agent_stream_started")
+                    stream_started = True
+                elif event.get("type") == "content_delta":
+                    text = str(event.get("text", ""))
+                    if text:
+                        streamed_any_text = True
+                        self._emit_progress("agent_stream_delta", text=text)
+                elif event.get("type") == "content_end" and stream_started:
+                    self._emit_progress("agent_stream_finished")
+                    stream_started = False
+
+            try:
+                response = self.client.chat(
+                    model=self.settings.agent_model,
+                    messages=messages,
+                    tools=[tool["schema"] for tool in self._tools.values()],
+                    stream=stream_enabled,
+                    on_delta=on_delta if stream_enabled else None,
+                )
+            except Exception:
+                if stream_started:
+                    self._emit_progress("agent_stream_finished")
+                if not stream_enabled:
+                    raise
+                stream_enabled = False
+                self._emit_progress(
+                    "narration",
+                    message=(
+                        "Streaming model output is unavailable on this endpoint, so I am falling back "
+                        "to buffered assistant responses for the rest of this run."
+                    ),
+                )
+                response = self.client.chat(
+                    model=self.settings.agent_model,
+                    messages=messages,
+                    tools=[tool["schema"] for tool in self._tools.values()],
+                )
             message = response.message
             assistant_message: dict[str, Any] = {"role": "assistant"}
             if "content" in message:
                 assistant_message["content"] = message.get("content", "")
+            note = OpenAICompatClient._message_text(message).strip()
+            if note and not streamed_any_text:
+                note = " ".join(note.split())
+                if len(note) > 320:
+                    note = note[:317].rstrip() + "..."
+                self._emit_progress("agent_note", content=note)
             if message.get("tool_calls"):
                 assistant_message["tool_calls"] = message["tool_calls"]
             messages.append(assistant_message)
