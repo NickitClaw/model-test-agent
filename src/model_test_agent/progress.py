@@ -180,6 +180,11 @@ class ConsoleProgressReporter:
                 f"I have enough context from the document. I am now using {event['model']} to convert it into "
                 "structured sessions and steps, and I will fill in any omitted waits or cleanup actions."
             )
+        if name == "planning_retry":
+            return (
+                f"The previous planning attempt did not validate, so I am retrying "
+                f"({event['attempt']}/{event['max_attempts']}). Validation detail: {event['reason']}"
+            )
         if name == "workflow_planned":
             return self._format_workflow_plan(event)
         if name == "workflow_execution_started":

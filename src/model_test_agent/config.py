@@ -31,6 +31,7 @@ class Settings:
     session_buffer_max_chars: int = 200000
     default_capture_lines: int = 300
     default_timeout_s: int = 300
+    planner_max_attempts: int = 3
     max_iterations: int = 60
     stream_agent_output: bool = True
 
@@ -50,6 +51,9 @@ class Settings:
         )
         default_capture_lines = int(os.getenv("MTA_CAPTURE_LINES", os.getenv("MBA_CAPTURE_LINES", "300")))
         default_timeout_s = int(os.getenv("MTA_TIMEOUT_S", os.getenv("MBA_TIMEOUT_S", "300")))
+        planner_max_attempts = int(
+            os.getenv("MTA_PLANNER_MAX_ATTEMPTS", os.getenv("MBA_PLANNER_MAX_ATTEMPTS", "3"))
+        )
         max_iterations = int(os.getenv("MTA_MAX_ITERATIONS", os.getenv("MBA_MAX_ITERATIONS", "60")))
         stream_agent_output = _env_bool(
             os.getenv("MTA_STREAM_AGENT_OUTPUT", os.getenv("MBA_STREAM_AGENT_OUTPUT")),
@@ -68,6 +72,7 @@ class Settings:
             session_buffer_max_chars=session_buffer_max_chars,
             default_capture_lines=default_capture_lines,
             default_timeout_s=default_timeout_s,
+            planner_max_attempts=planner_max_attempts,
             max_iterations=max_iterations,
             stream_agent_output=stream_agent_output,
         )

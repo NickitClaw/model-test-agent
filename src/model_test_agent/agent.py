@@ -63,6 +63,12 @@ class ModelTestAgent:
             return
         self._progress_callback({"event": event, **payload})
 
+    def _describe_state(self, *, include_diagnostics: bool = False) -> dict[str, Any]:
+        try:
+            return self.executor.describe_state(include_diagnostics=include_diagnostics)
+        except TypeError:
+            return self.executor.describe_state()
+
     def run(self) -> AgentRunReport:
         self.settings.require_model_access()
         workflow_json = json.dumps(self.executor.workflow.to_dict(), ensure_ascii=False, indent=2)
@@ -180,7 +186,7 @@ class ModelTestAgent:
                 self._final_status = self._final_status or "completed"
                 self._final_summary = self._final_summary or str(message.get("content", "")).strip() or "Run finished"
                 break
-        state = self.executor.describe_state()
+        state = self._describe_state(include_diagnostics=True)
         self._final_status, self._final_summary = self._normalize_final_outcome(
             state=state,
             status=self._final_status,

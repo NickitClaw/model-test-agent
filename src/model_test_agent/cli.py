@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import textwrap
 import time
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,8 @@ from .planner import WorkflowPlanner
 from .progress import ConsoleProgressReporter, summarize_workflow
 from .runtime.executor import WorkflowExecutor
 from .runtime.factory import resolve_session_backend
+from .workflow_schema import get_workflow_json_schema
+from .workflow_validation import build_and_validate_workflow
 from .workflow_enricher import WorkflowEnricher
 from .workflow_normalizer import WorkflowNormalizer
 
@@ -31,6 +34,37 @@ def main() -> None:
     loader = DocumentLoader()
     if args.command == "doctor":
         _doctor(settings)
+        return
+    if args.command == "runs":
+        root = Path(args.root or settings.log_root).expanduser()
+        if not root.is_absolute():
+            root = Path.cwd() / root
+        rows = _collect_runs(root, status=args.status, limit=args.limit)
+        if args.json:
+            print(json.dumps(rows, indent=2, ensure_ascii=False))
+        else:
+            print(_format_runs_table(rows, root=root))
+        return
+    if args.command == "show-run":
+        root = Path(args.root or settings.log_root).expanduser()
+        if not root.is_absolute():
+            root = Path.cwd() / root
+        payload = _resolve_run_summary(root=root, selector=args.run)
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print(_format_single_run(payload))
+        return
+    if args.command == "schema":
+        payload = json.dumps(get_workflow_json_schema(), indent=2, ensure_ascii=False)
+        if args.output:
+            Path(args.output).write_text(payload)
+        else:
+            print(payload)
+        return
+    if args.command == "validate-workflow":
+        workflow = _load_workflow(Path(args.workflow), normalize=False, enrich=False)
+        print(f"workflow is valid: {workflow.name}")
         return
     if args.command == "plan":
         reporter = ConsoleProgressReporter()
@@ -61,9 +95,7 @@ def main() -> None:
         return
     if args.command == "run-workflow":
         reporter = ConsoleProgressReporter()
-        workflow = WorkflowSpec.from_dict(json.loads(Path(args.workflow).read_text()))
-        workflow = normalizer.normalize(workflow, args.workflow)
-        workflow = enricher.enrich(workflow)
+        workflow = _load_workflow(Path(args.workflow), normalizer=normalizer, enricher=enricher)
         try:
             reporter.emit({"event": "workflow_execution_started", **summarize_workflow(workflow)})
             report = _run_workflow_with_agent(workflow, settings, reporter=reporter)
@@ -80,9 +112,7 @@ def main() -> None:
         return
     if args.command == "exec-workflow":
         reporter = ConsoleProgressReporter()
-        workflow = WorkflowSpec.from_dict(json.loads(Path(args.workflow).read_text()))
-        workflow = normalizer.normalize(workflow, args.workflow)
-        workflow = enricher.enrich(workflow)
+        workflow = _load_workflow(Path(args.workflow), normalizer=normalizer, enricher=enricher)
         try:
             reporter.emit({"event": "workflow_execution_started", **summarize_workflow(workflow)})
             _exec_workflow(workflow, settings, keep_sessions=args.keep_sessions, reporter=reporter)
@@ -133,6 +163,27 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="Check local CLI prerequisites")
     doctor.set_defaults(command="doctor")
 
+    runs = sub.add_parser("runs", help="List recent run summaries from .mta-runs")
+    runs.add_argument("--root", help="Override run log root")
+    runs.add_argument("--status", help="Filter by run status")
+    runs.add_argument("--limit", type=int, default=10, help="Maximum runs to display")
+    runs.add_argument("--json", action="store_true", help="Print runs as JSON")
+    runs.set_defaults(command="runs")
+
+    show_run = sub.add_parser("show-run", help="Show one structured run summary")
+    show_run.add_argument("run", help="Run id, run directory name, or path to summary.json/run dir")
+    show_run.add_argument("--root", help="Override run log root")
+    show_run.add_argument("--json", action="store_true", help="Print the raw summary JSON")
+    show_run.set_defaults(command="show-run")
+
+    schema = sub.add_parser("schema", help="Print the workflow JSON Schema")
+    schema.add_argument("--output", help="Write schema JSON to this path")
+    schema.set_defaults(command="schema")
+
+    validate = sub.add_parser("validate-workflow", help="Validate a workflow JSON file")
+    validate.add_argument("workflow", help="Path to a workflow JSON file")
+    validate.set_defaults(command="validate-workflow")
+
     plan = sub.add_parser("plan", help="Plan a workflow from a document")
     plan.add_argument("document", help="Path to a Markdown/TXT/PDF document")
     plan.add_argument("--output", help="Write workflow JSON to this path")
@@ -174,6 +225,100 @@ def _doctor(settings: Settings) -> None:
     print(f"model access: {model_state}")
 
 
+def _load_workflow(
+    path: Path,
+    *,
+    normalizer: WorkflowNormalizer | None = None,
+    enricher: WorkflowEnricher | None = None,
+    normalize: bool = True,
+    enrich: bool = True,
+) -> WorkflowSpec:
+    payload = json.loads(path.read_text())
+    workflow = build_and_validate_workflow(payload)
+    if normalize:
+        workflow = (normalizer or WorkflowNormalizer()).normalize(workflow, path)
+    if enrich:
+        workflow = (enricher or WorkflowEnricher()).enrich(workflow)
+    return workflow
+
+
+def _collect_runs(root: Path, *, status: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
+    if not root.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for summary_path in sorted(root.glob("*/summary.json"), reverse=True):
+        try:
+            payload = json.loads(summary_path.read_text())
+        except Exception:
+            continue
+        if status and str(payload.get("status")) != status:
+            continue
+        state = payload.get("state", {})
+        run = state.get("run", {})
+        rows.append(
+            {
+                "run_id": payload.get("run_id") or run.get("id"),
+                "workflow": payload.get("workflow"),
+                "status": payload.get("status"),
+                "summary": payload.get("summary"),
+                "iterations": payload.get("iterations"),
+                "backend": run.get("backend"),
+                "log_dir": run.get("log_dir"),
+                "summary_path": str(summary_path),
+                "ts": payload.get("ts"),
+            }
+        )
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _resolve_run_summary(*, root: Path, selector: str) -> dict[str, Any]:
+    candidate = Path(selector).expanduser()
+    summary_path: Path | None = None
+    if candidate.exists():
+        if candidate.is_dir():
+            summary_path = candidate / "summary.json"
+        else:
+            summary_path = candidate
+    else:
+        by_id = sorted(root.glob(f"*{selector}*/summary.json"))
+        if by_id:
+            summary_path = by_id[-1]
+        else:
+            direct = root / selector / "summary.json"
+            if direct.exists():
+                summary_path = direct
+    if summary_path is None or not summary_path.exists():
+        raise FileNotFoundError(f"Could not resolve run summary for {selector!r}")
+    return json.loads(summary_path.read_text())
+
+
+def _format_runs_table(rows: list[dict[str, Any]], *, root: Path) -> str:
+    if not rows:
+        return f"No runs found under {root}"
+    lines = [f"Recent runs under {root}"]
+    for item in rows:
+        lines.append(
+            f"- {item.get('run_id')} | {item.get('status')} | {item.get('workflow')} | "
+            f"backend={item.get('backend')} | dir={item.get('log_dir')}"
+        )
+        summary = str(item.get("summary") or "").strip()
+        if summary:
+            lines.append(f"  summary: {summary}")
+    return "\n".join(lines)
+
+
+def _format_single_run(payload: dict[str, Any]) -> str:
+    state = payload.get("state", {})
+    return _format_run_summary(
+        status=str(payload.get("status") or "unknown"),
+        summary=str(payload.get("summary") or ""),
+        state=state,
+        iterations=payload.get("iterations"),
+    )
+
+
 def _exec_workflow(
     workflow: WorkflowSpec,
     settings: Settings,
@@ -198,13 +343,18 @@ def _exec_workflow(
             step_id = ready[0]
             executor.run_step(step_id)
             time.sleep(0.05)
-        final_state = executor.describe_state()
+        final_state = executor.describe_state(include_diagnostics=True)
         print(
             _format_run_summary(
                 status=_derive_run_status(final_state),
                 summary="Workflow finished",
                 state=final_state,
             )
+        )
+        executor.write_summary_artifact(
+            status=_derive_run_status(final_state),
+            summary="Workflow finished",
+            state=final_state,
         )
     finally:
         if own_reporter:
@@ -230,7 +380,14 @@ def _run_workflow_with_agent(
             executor=executor,
             progress_callback=reporter.emit,
         )
-        return agent.run()
+        report = agent.run()
+        executor.write_summary_artifact(
+            status=report.status,
+            summary=report.summary,
+            state=report.state,
+            iterations=report.iterations,
+        )
+        return report
     finally:
         if own_reporter:
             reporter.stop()
@@ -248,6 +405,7 @@ def _format_run_summary(
     workflow = state.get("workflow", {})
     steps = state.get("steps", [])
     sessions = state.get("sessions", [])
+    failure_excerpts = list((run.get("failure_excerpts") or []))
     total = len(steps)
     completed = sum(1 for item in steps if item.get("status") in {"completed", "skipped"})
     failed = [item for item in steps if item.get("status") == "failed"]
@@ -266,6 +424,10 @@ def _format_run_summary(
         lines.append(f"backend: {run['backend']}")
     if run.get("log_dir"):
         lines.append(f"log dir: {run['log_dir']}")
+    if run.get("event_log_path"):
+        lines.append(f"events: {run['event_log_path']}")
+    if run.get("summary_path"):
+        lines.append(f"summary json: {run['summary_path']}")
     lines.append(
         "steps: "
         f"{completed}/{total} completed, "
@@ -280,6 +442,21 @@ def _format_run_summary(
             result = item.get("result") or {}
             detail = result.get("summary") or "failed"
             lines.append(f"- {item.get('id')}: {detail}")
+
+    if failure_excerpts:
+        lines.append("failure excerpts:")
+        for item in failure_excerpts[:3]:
+            source_kind = item.get("source_kind") or "summary"
+            source_path = item.get("source_path")
+            source = f" [{source_kind}]"
+            if source_path:
+                source += f" {source_path}"
+            lines.append(f"- {item.get('step_id')}{source}")
+            excerpt = str(item.get("excerpt") or "").strip()
+            if excerpt:
+                lines.extend(textwrap.indent(excerpt, "  ").splitlines())
+        if len(failure_excerpts) > 3:
+            lines.append(f"... {len(failure_excerpts) - 3} more failure excerpt(s) omitted")
 
     if background:
         lines.append("background steps:")

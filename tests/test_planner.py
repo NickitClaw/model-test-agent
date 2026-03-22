@@ -21,6 +21,17 @@ class FakePlannerClient:
         return self.payload
 
 
+class SequencedPlannerClient:
+    def __init__(self, payloads: list[dict[str, object]]) -> None:
+        self.payloads = payloads
+        self.calls: list[str] = []
+
+    def complete_json(self, *, model: str, system_prompt: str, user_prompt: str) -> dict[str, object]:
+        del model, system_prompt
+        self.calls.append(user_prompt)
+        return self.payloads.pop(0)
+
+
 class FakeStreamingPlannerClient(FakePlannerClient):
     def chat(self, *, model: str, messages, stream: bool = False, on_delta=None, **kwargs):
         del model, messages, kwargs
@@ -192,6 +203,59 @@ class PlannerTests(unittest.TestCase):
             self.assertIn("planner_stream_started", names)
             self.assertIn("planner_stream_delta", names)
             self.assertIn("planner_stream_finished", names)
+
+    def test_planner_retries_when_initial_payload_is_invalid(self) -> None:
+        client = SequencedPlannerClient(
+            [
+                {
+                    "name": "demo",
+                    "objective": "demo",
+                    "sessions": {"server": {"transport": "local"}},
+                    "steps": [
+                        {
+                            "id": "launch_server",
+                            "kind": "command",
+                            "title": "Launch server",
+                            "session": "missing",
+                            "command": "python3 app.py",
+                        }
+                    ],
+                },
+                {
+                    "name": "demo",
+                    "objective": "demo",
+                    "sessions": {"server": {"transport": "local"}},
+                    "steps": [
+                        {
+                            "id": "launch_server",
+                            "kind": "command",
+                            "title": "Launch server",
+                            "session": "server",
+                            "command": "python3 app.py",
+                        }
+                    ],
+                },
+            ]
+        )
+        planner = WorkflowPlanner(
+            Settings(
+                base_url="http://example.com/v1",
+                api_key="",
+                model="test-model",
+                planner_model="test-model",
+                agent_model="test-model",
+                planner_max_attempts=2,
+            ),
+            client=client,
+        )
+
+        workflow = planner.plan(
+            DocumentContent(path=Path("runbook.md"), media_type="text/markdown", text="```bash\npython3 app.py\n```")
+        )
+
+        self.assertEqual(workflow.sessions["server"].transport.value, "local")
+        self.assertEqual(len(client.calls), 2)
+        self.assertIn("The previous JSON was invalid", client.calls[-1])
 
 
 if __name__ == "__main__":

@@ -84,28 +84,40 @@ class WorkflowEnricher:
 
     def _is_server_candidate(self, step: CommandStep, later_steps: list[WorkflowStep]) -> bool:
         haystack = f"{step.title} {step.command}".lower()
+        if step.background or step.ready_pattern:
+            return True
         if any(token in haystack for token in SERVER_HINTS):
             return True
         if self._extract_startup_delay(step.command) is not None:
             return True
-        return any(self._looks_like_network_client(item) for item in later_steps)
+        launch_endpoint = self._extract_host_port(step.command)
+        if launch_endpoint is None:
+            return False
+        return any(self._step_targets_launch_endpoint(step, item) for item in later_steps)
 
-    def _find_consumers(self, launch_step: CommandStep, later_steps: list[WorkflowStep]) -> list[CommandStep]:
-        consumers: list[CommandStep] = []
+    def _find_consumers(self, launch_step: CommandStep, later_steps: list[WorkflowStep]) -> list[WorkflowStep]:
+        consumers: list[WorkflowStep] = []
         for step in later_steps:
-            if not isinstance(step, CommandStep):
-                continue
-            if self._looks_like_network_client(step):
+            if self._step_targets_launch_endpoint(launch_step, step):
                 consumers.append(step)
                 continue
-            if step.session and launch_step.session and step.session != launch_step.session:
+            if (
+                isinstance(step, CommandStep)
+                and step.session
+                and launch_step.session
+                and step.session != launch_step.session
+                and self._has_strong_server_identity(launch_step)
+                and not self._has_strong_server_identity(step)
+                and not self._looks_like_network_client(step)
+            ):
                 consumers.append(step)
         return consumers
 
     def _looks_like_network_client(self, step: WorkflowStep) -> bool:
-        if not isinstance(step, CommandStep):
+        command = self._step_command_text(step)
+        if not command:
             return False
-        haystack = f"{step.title} {step.command}".lower()
+        haystack = f"{getattr(step, 'title', '')} {command}".lower()
         return any(token in haystack for token in CLIENT_HINTS)
 
     def _attach_dependencies(self, consumers: Iterable[CommandStep], dep_id: str) -> None:
@@ -116,10 +128,17 @@ class WorkflowEnricher:
     def _build_inferred_wait(
         self,
         launch_step: CommandStep,
-        consumers: list[CommandStep],
+        consumers: list[WorkflowStep],
         existing_ids: set[str],
     ) -> ProbeStep | None:
-        safe_curl = next((step for step in consumers if self._is_safe_curl(step.command)), None)
+        safe_curl = next(
+            (
+                step
+                for step in consumers
+                if isinstance(step, CommandStep) and self._is_safe_curl(step.command)
+            ),
+            None,
+        )
         if safe_curl:
             probe_command = safe_curl.command
             probe_session = safe_curl.session or launch_step.session
@@ -129,9 +148,12 @@ class WorkflowEnricher:
             url = None
             probe_session = None
             for step in consumers:
-                url = self._extract_url(step.command)
+                command = self._step_command_text(step)
+                if not command:
+                    continue
+                url = self._extract_url(command)
                 if url:
-                    probe_session = step.session or launch_step.session
+                    probe_session = getattr(step, "session", None) or launch_step.session
                     break
             if url:
                 probe_command = f"curl --fail --silent {shlex.quote(url)}"
@@ -148,7 +170,8 @@ class WorkflowEnricher:
                     "s.close()"
                 )
                 probe_command = f"python3 -c {shlex.quote(code)}"
-                probe_session = consumers[0].session or launch_step.session
+                first_consumer_session = getattr(consumers[0], "session", None) if consumers else None
+                probe_session = first_consumer_session or launch_step.session
                 success_patterns = []
                 fail_patterns = []
         probe_id = self._unique_id(f"{launch_step.id}_wait_ready", existing_ids)
@@ -172,7 +195,7 @@ class WorkflowEnricher:
     def _attach_sleep_fallback(
         self,
         launch_step: CommandStep,
-        consumers: list[CommandStep],
+        consumers: list[WorkflowStep],
         new_steps: list[WorkflowStep],
         existing_ids: set[str],
     ) -> bool:
@@ -235,10 +258,14 @@ class WorkflowEnricher:
                     continue
                 if getattr(item, "session", None) != launch_session:
                     continue
-                if isinstance(item, CommandStep) and self._should_move_command_off_server_session(item):
+                if isinstance(item, CommandStep) and self._should_move_command_off_server_session(item, step):
                     target_session = target_session or self._ensure_cloned_session(workflow, launch_session)
                     item.session = target_session
-                elif isinstance(item, ProbeStep) and launch_session in workflow.sessions and self._is_network_probe(item):
+                elif (
+                    isinstance(item, ProbeStep)
+                    and launch_session in workflow.sessions
+                    and self._is_network_probe(item, step)
+                ):
                     target_session = target_session or self._ensure_cloned_session(workflow, launch_session)
                     item.session = target_session
 
@@ -280,9 +307,12 @@ class WorkflowEnricher:
             return match.group(0)
         return None
 
-    def _extract_host_port_from_steps(self, steps: list[CommandStep]) -> tuple[str, int] | None:
+    def _extract_host_port_from_steps(self, steps: list[WorkflowStep]) -> tuple[str, int] | None:
         for step in steps:
-            endpoint = self._extract_host_port(step.command)
+            command = self._step_command_text(step)
+            if not command:
+                continue
+            endpoint = self._extract_host_port(command)
             if endpoint:
                 return endpoint
         return None
@@ -333,15 +363,51 @@ class WorkflowEnricher:
         unsafe_tokens = (" -x ", "--request ", " -d ", "--data", "--data-binary", "--form")
         return not any(token in lowered for token in unsafe_tokens)
 
-    def _is_network_probe(self, step: ProbeStep) -> bool:
+    def _is_network_probe(self, step: ProbeStep, launch_step: CommandStep | None = None) -> bool:
         lowered = step.command.lower()
-        return self._is_safe_curl(step.command) or "http://" in lowered or "https://" in lowered
+        if not (self._is_safe_curl(step.command) or "http://" in lowered or "https://" in lowered):
+            return False
+        if launch_step is None:
+            return True
+        return self._step_targets_launch_endpoint(launch_step, step)
 
-    def _should_move_command_off_server_session(self, step: CommandStep) -> bool:
-        if self._looks_like_network_client(step):
+    def _should_move_command_off_server_session(self, step: CommandStep, launch_step: CommandStep) -> bool:
+        if self._step_targets_launch_endpoint(launch_step, step):
             return True
         lowered = step.command.lower()
         return "pkill" in lowered or "killall" in lowered or re.search(r"(?:^|\s)kill\s", lowered) is not None
+
+    def _step_targets_launch_endpoint(self, launch_step: CommandStep, step: WorkflowStep) -> bool:
+        command = self._step_command_text(step)
+        if not command:
+            return False
+        if not self._looks_like_network_client(step) and not isinstance(step, ProbeStep):
+            return False
+        launch_endpoint = self._extract_host_port(launch_step.command)
+        target_endpoint = self._extract_host_port(command)
+        if launch_endpoint and target_endpoint:
+            return launch_endpoint == target_endpoint
+        if launch_endpoint:
+            url = self._extract_url(command)
+            return bool(url)
+        return self._has_strong_server_identity(launch_step)
+
+    def _has_strong_server_identity(self, step: CommandStep) -> bool:
+        haystack = f"{step.title} {step.command}".lower()
+        return (
+            step.background
+            or bool(step.ready_pattern)
+            or any(token in haystack for token in SERVER_HINTS)
+            or self._extract_startup_delay(step.command) is not None
+        )
+
+    @staticmethod
+    def _step_command_text(step: WorkflowStep) -> str | None:
+        if isinstance(step, CommandStep):
+            return step.command
+        if isinstance(step, ProbeStep):
+            return step.command
+        return None
 
     def _unique_id(self, base: str, existing_ids: set[str]) -> str:
         candidate = re.sub(r"[^a-zA-Z0-9_]+", "_", base).strip("_") or "step"

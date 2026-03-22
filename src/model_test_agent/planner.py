@@ -8,6 +8,7 @@ from .config import Settings
 from .document_loader import DocumentContent
 from .models import WorkflowSpec
 from .openai_compat import OpenAICompatClient
+from .workflow_validation import WorkflowValidationError, build_and_validate_workflow, validate_workflow_spec
 from .workflow_enricher import WorkflowEnricher
 from .workflow_normalizer import WorkflowNormalizer
 
@@ -133,14 +134,37 @@ class WorkflowPlanner:
             extra_instructions=extra_instructions,
             analysis=analysis,
         )
-        payload = self.client.complete_json(
-            model=self.settings.planner_model,
-            system_prompt=PLANNER_SYSTEM_PROMPT,
-            user_prompt=body,
-        )
-        workflow = WorkflowSpec.from_dict(payload)
-        workflow = self.normalizer.normalize(workflow, document.path)
-        return self.enricher.enrich(workflow)
+        last_error: Exception | None = None
+        retry_hint = ""
+        for attempt in range(1, self.settings.planner_max_attempts + 1):
+            payload = self.client.complete_json(
+                model=self.settings.planner_model,
+                system_prompt=PLANNER_SYSTEM_PROMPT,
+                user_prompt=body + retry_hint,
+            )
+            try:
+                workflow = build_and_validate_workflow(payload)
+                workflow = self.normalizer.normalize(workflow, document.path)
+                workflow = self.enricher.enrich(workflow)
+                validate_workflow_spec(workflow)
+                return workflow
+            except (TypeError, ValueError, KeyError, WorkflowValidationError) as exc:
+                last_error = exc
+                if attempt >= self.settings.planner_max_attempts:
+                    break
+                retry_hint = (
+                    "\n\nPlanner retry instructions:\n"
+                    f"The previous JSON was invalid: {exc}\n"
+                    "Return a corrected workflow JSON that satisfies the declared schema. "
+                    "Do not omit required fields. Keep session references and step dependencies consistent."
+                )
+                self._emit_progress(
+                    "planning_retry",
+                    attempt=attempt + 1,
+                    max_attempts=self.settings.planner_max_attempts,
+                    reason=str(exc),
+                )
+        raise RuntimeError(f"Planner could not produce a valid workflow after {self.settings.planner_max_attempts} attempt(s): {last_error}")
 
     @staticmethod
     def dump(workflow: WorkflowSpec) -> str:

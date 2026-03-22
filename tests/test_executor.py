@@ -168,6 +168,7 @@ class ExecutorTests(unittest.TestCase):
 
             state = executor.describe_state()
             self.assertTrue(Path(state["run"]["log_dir"]).is_dir())
+            self.assertTrue(Path(state["run"]["event_log_path"]).exists())
             session = state["sessions"][0]
             self.assertTrue(Path(session["combined_log_path"]).exists())
             self.assertTrue(Path(session["stdout_log_path"]).exists())
@@ -178,6 +179,9 @@ class ExecutorTests(unittest.TestCase):
             self.assertIn("tee -a", wrapped_command)
             self.assertIn(session["stdout_log_path"], wrapped_command)
             self.assertIn(session["stderr_log_path"], wrapped_command)
+
+            executor.write_summary_artifact(status="completed", summary="ok", state=state)
+            self.assertTrue(Path(state["run"]["summary_path"]).exists())
 
     def test_session_log_directories_use_clear_role_names(self) -> None:
         workflow = WorkflowSpec.from_dict(

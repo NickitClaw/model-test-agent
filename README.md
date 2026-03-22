@@ -59,6 +59,11 @@ The agent reads these environment variables:
 - `MTA_TMUX_BIN` to override the `tmux` binary path
 - `MTA_LOG_ROOT` to override the per-run log root directory. Defaults to `.mta-runs` under the current working directory.
 - `MTA_SESSION_BUFFER_MAX_CHARS` to control how much recent PTY output is retained
+- `MTA_CAPTURE_LINES` to control how many recent lines are used for waits, probes, and captures
+- `MTA_TIMEOUT_S` to override the default per-step timeout in seconds
+- `MTA_POLL_INTERVAL_S` to control backend wait polling cadence
+- `MTA_PLANNER_MAX_ATTEMPTS` to control how many times the planner retries when the first JSON does not validate
+- `MTA_MAX_ITERATIONS` to control the supervising agent loop limit
 - `MTA_STREAM_AGENT_OUTPUT=true|false` to control whether the agent streams its natural-language narration token by token when the model endpoint supports SSE
 
 ## CLI
@@ -97,6 +102,30 @@ Check local runtime prerequisites:
 mta doctor
 ```
 
+List recent structured runs:
+
+```bash
+mta runs --limit 10
+```
+
+Inspect one run by run id, run directory name, or path:
+
+```bash
+mta show-run 13876932
+```
+
+Print the formal workflow JSON Schema:
+
+```bash
+mta schema --output workflow.schema.json
+```
+
+Validate a workflow JSON file before running it:
+
+```bash
+mta validate-workflow workflow.json
+```
+
 Run the local PTY end-to-end validation:
 
 ```bash
@@ -130,6 +159,45 @@ The enrichment layer can infer common missing details from minimal docs, for exa
 - Adding a readiness `probe` when a server launch is followed by `curl` or another client step
 - Converting a foreground server launch into a background step when later steps need the service to stay up
 - Appending a cleanup `Ctrl-C` step when the runbook omits server shutdown
+
+The enricher now also prefers endpoint-aware matching when multiple services appear in the same runbook, which reduces false positives where one later `curl` could otherwise be attached to the wrong launch step.
+
+The project now exposes a formal JSON Schema through `mta schema`. Internally, planned and loaded workflows are also validated for:
+
+- Duplicate step ids
+- Unknown session references
+- Unknown dependencies in `depends_on`
+- Unknown `wait_for` targets in barrier steps
+- Unknown `target_step` values in decision rules
+
+If the planner returns invalid JSON on the first pass, the planner retries with the validation error fed back into the next prompt.
+
+## Structured Logs
+
+Each run directory under `.mta-runs/` now contains:
+
+- `events.jsonl`: machine-readable progress and lifecycle events
+- `summary.json`: final structured run summary, including failed-step log excerpts when available
+- Per-session `session.log`, `stdout.log`, and `stderr.log`
+
+This is in addition to the operator-facing terminal narration.
+
+## Tuning Guidance
+
+Recommended starting points:
+
+- `MTA_PLANNER_MAX_ATTEMPTS=3`
+  Good default for planner reliability without causing excessive duplicate model calls.
+- `MTA_MAX_ITERATIONS=60`
+  Fine for short and medium workflows. Increase to `120` for long multi-stage benchmark runs.
+- `MTA_TIMEOUT_S=300`
+  Good general-purpose default. Raise to `900` or higher for slow model downloads, container builds, or large warmups.
+- `MTA_CAPTURE_LINES=300`
+  Good balance for readiness checks. Increase if the target system emits long multi-line banners before the signal you need.
+- `MTA_SESSION_BUFFER_MAX_CHARS=200000`
+  Suitable for ordinary service logs. Increase for very noisy benchmark output when waits may need to inspect more history.
+- `MTA_POLL_INTERVAL_S=1.0`
+  Good default for responsiveness without over-polling. Lower it only if you need tighter feedback on short waits.
 
 ## Example
 

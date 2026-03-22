@@ -177,6 +177,89 @@ class WorkflowEnricherTests(unittest.TestCase):
         self.assertEqual(curl.session, "server_client")
         self.assertEqual(cleanup.session, "server_client")
 
+    def test_enricher_does_not_treat_plain_setup_command_as_server(self) -> None:
+        workflow = WorkflowSpec.from_dict(
+            {
+                "name": "no-false-server",
+                "objective": "avoid false positives",
+                "sessions": {
+                    "setup": {"transport": "local"},
+                    "client": {"transport": "local"},
+                },
+                "steps": [
+                    {
+                        "id": "prepare_env",
+                        "kind": "command",
+                        "title": "Prepare env",
+                        "session": "setup",
+                        "command": "echo preparing benchmark environment",
+                    },
+                    {
+                        "id": "call_remote",
+                        "kind": "command",
+                        "title": "Call remote endpoint",
+                        "session": "client",
+                        "command": "curl --fail --silent https://example.com/healthz",
+                    },
+                ],
+            }
+        )
+
+        enriched = WorkflowEnricher().enrich(workflow)
+        prepare = next(step for step in enriched.steps if step.id == "prepare_env")
+        self.assertIsInstance(prepare, CommandStep)
+        self.assertFalse(prepare.background)
+        self.assertFalse(any(isinstance(step, ProbeStep) for step in enriched.steps))
+
+    def test_enricher_matches_consumers_to_the_correct_server_endpoint(self) -> None:
+        workflow = WorkflowSpec.from_dict(
+            {
+                "name": "two-servers",
+                "objective": "match probes to the correct endpoint",
+                "sessions": {
+                    "svc_a": {"transport": "local"},
+                    "svc_b": {"transport": "local"},
+                    "client": {"transport": "local"},
+                },
+                "steps": [
+                    {
+                        "id": "launch_a",
+                        "kind": "command",
+                        "title": "Launch service A",
+                        "session": "svc_a",
+                        "command": "python3 server_a.py --host 127.0.0.1 --port 18080",
+                    },
+                    {
+                        "id": "launch_b",
+                        "kind": "command",
+                        "title": "Launch service B",
+                        "session": "svc_b",
+                        "command": "python3 server_b.py --host 127.0.0.1 --port 18081",
+                    },
+                    {
+                        "id": "curl_b",
+                        "kind": "command",
+                        "title": "Call service B",
+                        "session": "client",
+                        "command": "curl --fail --silent http://127.0.0.1:18081/healthz",
+                    },
+                ],
+            }
+        )
+
+        enriched = WorkflowEnricher().enrich(workflow)
+        launch_a = next(step for step in enriched.steps if step.id == "launch_a")
+        launch_b = next(step for step in enriched.steps if step.id == "launch_b")
+        curl_b = next(step for step in enriched.steps if step.id == "curl_b")
+        probes = [step for step in enriched.steps if isinstance(step, ProbeStep)]
+
+        self.assertFalse(launch_a.background)
+        self.assertTrue(launch_b.background)
+        self.assertEqual(len(probes), 1)
+        self.assertIn("18081", probes[0].command)
+        self.assertIn("launch_b", probes[0].depends_on)
+        self.assertIn(probes[0].id, curl_b.depends_on)
+
 
 if __name__ == "__main__":
     unittest.main()
