@@ -63,6 +63,8 @@ Convert a Markdown or PDF runbook into a workflow JSON object with this shape:
 Rules:
 - Preserve shell commands as faithfully as possible.
 - Use one persistent session per long-lived shell, SSH login, Docker TTY, or tmux-like workspace.
+- **CRITICAL**: When a document describes "creating a container" followed by "running commands inside the container", all those commands MUST use the SAME session as the docker_run/docker_exec step. Do NOT create separate local sessions for commands that should run inside the container.
+- For docker_run with -it and a shell (like /bin/bash), the container provides a persistent session; subsequent commands described as "inside the container" must use that same session.
 - For long-running processes like model servers, use `kind=command`, `background=true`, plus `ready_pattern`.
 - Use `kind=wait` when the document explicitly says to wait for a log line.
 - If the document omits common operator knowledge, infer it. Add readiness waits, probes, and cleanup steps when later steps depend on a server or background process.
